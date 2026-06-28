@@ -146,7 +146,7 @@ PHRASES = {
 def get_game_keyboard():
     """Создает инлайн-кнопку для вызова игры"""
     builder = InlineKeyboardBuilder()
-    builder.button(text="Узнать свой уровень 🎲", callback_data="roll_schizo")
+    builder.button(text="Узнать свой уровень 💊", callback_data="roll_schizo")
     return builder.as_markup()
 
 def generate_response(user: types.User) -> str:
