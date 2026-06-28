@@ -1,4 +1,5 @@
 import os
+import time
 import random
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
@@ -8,17 +9,21 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # === НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ ===
-# Получаем токен из безопасного хранилища (переменных окружения)
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения BOT_TOKEN не найдена!")
 
-# Инициализация бота с глобальной настройкой HTML-парсинга
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# === НАСТРОЙКИ АНТИ-СПАМА (Rate Limiting) ===
+# 3 часа = 3 * 60 минут * 60 секунд = 10800 секунд
+COOLDOWN_SECONDS = 3 * 60 * 60 
+# Словарь для хранения времени последнего броска: {user_id: timestamp}
+# В реальных HighLoad проектах тут используется Redis, но для нашего бота хватит ОЗУ.
+users_last_roll = {}
+
 # === БАЗА КОНТЕНТА ===
-# Словарь с диапазонами и соответствующими шуточными фразами
 PHRASES = {
     (0, 10): [
         "«Ты такой нормальный, что даже жить не хочется.»",
@@ -143,59 +148,79 @@ PHRASES = {
 }
 
 # === БИЗНЕС-ЛОГИКА ===
+def get_time_left(user_id: int) -> str | None:
+    """Проверяет, вышел ли кулдаун. Возвращает строку с остатком времени или None, если можно играть."""
+    if user_id in users_last_roll:
+        time_passed = time.time() - users_last_roll[user_id]
+        if time_passed < COOLDOWN_SECONDS:
+            time_left_sec = COOLDOWN_SECONDS - time_passed
+            hours = int(time_left_sec // 3600)
+            minutes = int((time_left_sec % 3600) // 60)
+            
+            if hours > 0:
+                return f"{hours} ч. {minutes} мин."
+            else:
+                return f"{minutes} мин."
+    return None
+
 def get_game_keyboard():
-    """Создает инлайн-кнопку для вызова игры"""
     builder = InlineKeyboardBuilder()
-    builder.button(text="Узнать свой уровень 💊", callback_data="roll_schizo")
+    builder.button(text="Узнать свой уровень 🎲", callback_data="roll_schizo")
     return builder.as_markup()
 
 def generate_response(user: types.User) -> str:
-    """Генерирует ответ с рандомным процентом и фразой из словаря"""
     score = random.randint(0, 100)
     selected_phrase = ""
-    
-    # Ищем подходящий диапазон по ключам словаря
     for (min_val, max_val), phrases in PHRASES.items():
         if min_val <= score <= max_val:
             selected_phrase = random.choice(phrases)
             break
             
-    # Формируем итоговый HTML-текст с кликабельным упоминанием пользователя
-    text = f"{user.mention_html()}, ваш уровень шизофрении <b>{score}%</b>!\n\n{selected_phrase}"
-    return text
+    return f"{user.mention_html()}, ваш уровень шизофрении <b>{score}%</b>!\n\n{selected_phrase}"
 
-# === ОБРАБОТЧИКИ СОБЫТИЙ (ХЕНДЛЕРЫ) ===
+# === ОБРАБОТЧИКИ СОБЫТИЙ ===
 @dp.message(Command("start", "game"))
 async def cmd_start(message: types.Message):
-    """
-    Точка входа. Обрабатывает команду /start (или /game).
-    Идеально подходит для первичной активации в чате.
-    """
+    user_id = message.from_user.id
+    
+    # 1. Проверяем кулдаун
+    time_left = get_time_left(user_id)
+    if time_left:
+        # Если время не вышло, отвечаем на сообщение пользователя
+        await message.reply(f"⏳ Вы уже узнавали свой уровень! Следующая попытка через <b>{time_left}</b>.")
+        return
+
+    # 2. Обновляем время (пользователь использовал попытку)
+    users_last_roll[user_id] = time.time()
+    
+    # 3. Отдаем результат
     response_text = generate_response(message.from_user)
     await message.answer(response_text, reply_markup=get_game_keyboard())
 
 @dp.callback_query(F.data == "roll_schizo")
 async def process_roll_callback(callback: types.CallbackQuery):
-    """
-    Перехватывает нажатия на инлайн-кнопку любым участником чата.
-    Отправляет НОВОЕ сообщение, чтобы результаты накапливались.
-    """
+    user_id = callback.from_user.id
+    
+    # 1. Проверяем кулдаун
+    time_left = get_time_left(user_id)
+    if time_left:
+        # ВАЖНО: show_alert=True показывает всплывающее окно прямо на экране, 
+        # не отправляя мусорные сообщения в общий чат.
+        await callback.answer(f"⏳ Вы уже проверялись!\nПодождите еще {time_left}.", show_alert=True)
+        return
+        
+    # 2. Обновляем время 
+    users_last_roll[user_id] = time.time()
+    
+    # 3. Отдаем результат в чат
     response_text = generate_response(callback.from_user)
-    
-    # Отправляем сообщение в чат с новой кнопкой для продолжения игры
     await callback.message.answer(response_text, reply_markup=get_game_keyboard())
-    
-    # Обязательный вызов, чтобы Telegram перестал показывать анимацию загрузки на кнопке
-    await callback.answer()
+    await callback.answer() # Убираем "часики" загрузки с кнопки
 
 # === ЗАПУСК ===
 async def main():
-    """Основной цикл приложения"""
-    # Игнорируем старые сообщения, накопившиеся, пока бот был выключен
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Бот успешно инициализирован и готов к приему апдейтов.")
-    
-    # Запускаем поллинг (постоянный опрос серверов Telegram)
+    print("Бот с анти-спамом успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
@@ -203,3 +228,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("Остановка работы бота...")
+
