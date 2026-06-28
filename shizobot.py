@@ -2,6 +2,7 @@ import os
 import time
 import random
 import asyncio
+import sqlite3
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -16,12 +17,23 @@ if not TOKEN:
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# === НАСТРОЙКИ АНТИ-СПАМА (Rate Limiting) ===
-# 3 часа = 3 * 60 минут * 60 секунд = 10800 секунд
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (SQLite) ===
+# Создаем подключение к файловой БД. Файл cooldowns.db создастся автоматически.
+db_conn = sqlite3.connect('cooldowns.db', check_same_thread=False)
+cursor = db_conn.cursor()
+
+# Создаем таблицу, если ее еще нет
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        last_roll REAL
+    )
+''')
+db_conn.commit()
+
+# === НАСТРОЙКИ АНТИ-СПАМА ===
+# 3 часа = 10800 секунд
 COOLDOWN_SECONDS = 3 * 60 * 60 
-# Словарь для хранения времени последнего броска: {user_id: timestamp}
-# В реальных HighLoad проектах тут используется Redis, но для нашего бота хватит ОЗУ.
-users_last_roll = {}
 
 # === БАЗА КОНТЕНТА ===
 PHRASES = {
@@ -147,25 +159,41 @@ PHRASES = {
     ]
 }
 
-# === БИЗНЕС-ЛОГИКА ===
+# === БИЗНЕС-ЛОГИКА С БД ===
 def get_time_left(user_id: int) -> str | None:
-    """Проверяет, вышел ли кулдаун. Возвращает строку с остатком времени или None, если можно играть."""
-    if user_id in users_last_roll:
-        time_passed = time.time() - users_last_roll[user_id]
+    """Извлекает время из БД и проверяет, вышел ли кулдаун."""
+    cursor.execute('SELECT last_roll FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    
+    if result:
+        last_roll = result[0]
+        time_passed = time.time() - last_roll
         if time_passed < COOLDOWN_SECONDS:
             time_left_sec = COOLDOWN_SECONDS - time_passed
             hours = int(time_left_sec // 3600)
             minutes = int((time_left_sec % 3600) // 60)
+            seconds = int(time_left_sec % 60)
             
             if hours > 0:
                 return f"{hours} ч. {minutes} мин."
-            else:
+            elif minutes > 0:
                 return f"{minutes} мин."
+            else:
+                return f"{seconds} сек."
     return None
+
+def update_user_roll_time(user_id: int):
+    """Записывает (или обновляет) в БД текущее время для пользователя."""
+    # REPLACE INTO работает как INSERT, но если user_id уже есть, он обновит запись
+    cursor.execute('''
+        REPLACE INTO users (user_id, last_roll)
+        VALUES (?, ?)
+    ''', (user_id, time.time()))
+    db_conn.commit()
 
 def get_game_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="Узнать свой уровень 💊", callback_data="roll_schizo")
+    builder.button(text="Узнать свой уровень 🎲", callback_data="roll_schizo")
     return builder.as_markup()
 
 def generate_response(user: types.User) -> str:
@@ -183,17 +211,14 @@ def generate_response(user: types.User) -> str:
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     
-    # 1. Проверяем кулдаун
     time_left = get_time_left(user_id)
     if time_left:
-        # Если время не вышло, отвечаем на сообщение пользователя
         await message.reply(f"⏳ Вы уже узнавали свой уровень! Следующая попытка через <b>{time_left}</b>.")
         return
 
-    # 2. Обновляем время (пользователь использовал попытку)
-    users_last_roll[user_id] = time.time()
+    # Записываем в базу данных
+    update_user_roll_time(user_id)
     
-    # 3. Отдаем результат
     response_text = generate_response(message.from_user)
     await message.answer(response_text, reply_markup=get_game_keyboard())
 
@@ -201,31 +226,29 @@ async def cmd_start(message: types.Message):
 async def process_roll_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     
-    # 1. Проверяем кулдаун
     time_left = get_time_left(user_id)
     if time_left:
-        # ВАЖНО: show_alert=True показывает всплывающее окно прямо на экране, 
-        # не отправляя мусорные сообщения в общий чат.
         await callback.answer(f"⏳ Вы уже проверялись!\nПодождите еще {time_left}.", show_alert=True)
         return
         
-    # 2. Обновляем время 
-    users_last_roll[user_id] = time.time()
+    # Записываем в базу данных
+    update_user_roll_time(user_id)
     
-    # 3. Отдаем результат в чат
     response_text = generate_response(callback.from_user)
     await callback.message.answer(response_text, reply_markup=get_game_keyboard())
-    await callback.answer() # Убираем "часики" загрузки с кнопки
+    await callback.answer()
 
 # === ЗАПУСК ===
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Бот с анти-спамом успешно запущен!")
+    print("Бот с аппаратной защитой от спама (SQLite) запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Остановка работы бота...")
+    finally:
+        # Корректно закрываем соединение с БД при остановке скрипта
+        db_conn.close()
+
 
