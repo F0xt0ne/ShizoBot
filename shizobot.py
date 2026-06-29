@@ -78,7 +78,7 @@ def update_user_roll_time(user_id: int):
 
 def get_game_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="Узнать свой уровень 🎲", callback_data="roll_schizo")
+    builder.button(text="Узнать свой уровень 💊", callback_data="roll_schizo")
     return builder.as_markup()
 
 def generate_response(user: types.User) -> str:
